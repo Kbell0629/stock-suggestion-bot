@@ -5,3 +5,4 @@ textblob
 requests
 lxml
 gunicorn
+ratelimit

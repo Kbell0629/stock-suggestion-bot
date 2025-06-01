@@ -5,11 +5,13 @@ from textblob import TextBlob
 import requests
 from datetime import datetime
 import os
+import time
+from ratelimit import limits, sleep_and_retry
 
 app = Flask(__name__)
 
 # Your NewsAPI key (replace with your actual key)
-NEWS_API_KEY = "c715f7725a3147dfbfa89e8d51ecd49b"
+NEWS_API_KEY = os.getenv("NEWS_API_KEY", "c715f7725a3147dfbfa89e8d51ecd49b")
 
 # Portfolio settings
 DAILY_INVESTMENT = 2500  # Total $2,500 per day
@@ -125,109 +127,120 @@ def get_all_tickers():
 # List of stocks to analyze
 STOCKS = get_all_tickers()
 
+# Rate limit yfinance requests: 2 calls per second
+@sleep_and_retry
+@limits(calls=2, period=1)
 def get_stock_data(ticker):
     """Fetch stock data and calculate indicators."""
     print(f"Processing {ticker}...")
-    try:
-        stock = yf.Ticker(ticker)
-        hist = stock.history(period="1mo", interval="1d")
+    for attempt in range(3):  # Retry up to 3 times
+        try:
+            stock = yf.Ticker(ticker)
+            hist = stock.history(period="1mo", interval="1d")
 
-        if hist.empty or len(hist) < 20:
-            print(f"No data for {ticker}")
+            if hist.empty or len(hist) < 20:
+                print(f"No data for {ticker}")
+                return None
+
+            # Calculate 5-day RSI
+            delta = hist['Close'].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=5).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=5).mean()
+            rs = gain / loss
+            rsi = 100 - (100 / (1 + rs))
+
+            # Calculate fast MACD (5, 13, 5)
+            exp1 = hist['Close'].ewm(span=5, adjust=False).mean()
+            exp2 = hist['Close'].ewm(span=13, adjust=False).mean()
+            macd = exp1 - exp2
+            signal = macd.ewm(span=5, adjust=False).mean()
+
+            # MACD momentum (increasing over 2 days)
+            macd_values = macd[-3:]
+            macd_momentum = all(macd_values[i] < macd_values[i+1] for i in range(len(macd_values)-1))
+
+            # Calculate Bollinger Bands and SMA
+            sma = hist['Close'].rolling(window=20).mean()
+            std = hist['Close'].rolling(window=20).std()
+            upper_band = sma + (std * 2)
+            lower_band = sma - (std * 2)
+
+            # Volatility
+            returns = hist['Close'].pct_change()
+            volatility = returns.std() * (252 ** 0.5)
+
+            # Volume (20-day average)
+            avg_volume = hist['Volume'].rolling(window=20).mean()[-1] if not hist['Volume'].empty else 0
+
+            # Fundamentals (P/E Ratio)
+            pe_ratio = stock.info.get('trailingPE', 0)
+
+            # Current price
+            current_price = hist['Close'][-1]
+
+            # 20-day high for breakout detection
+            high_20d = hist['High'].rolling(window=20).max()[-1]
+
+            # 5-day price momentum
+            price_5d_ago = hist['Close'][-6] if len(hist) >= 6 else current_price
+            price_momentum = (current_price - price_5d_ago) / price_5d_ago
+
+            # Entry price (20-day SMA + 1%)
+            entry_price = sma[-1] * 1.01
+
+            # Filter for stocks where current price has just passed entry price
+            if not (entry_price <= current_price <= entry_price * 1.05):
+                print(f"{ticker} current price {current_price:.2f} not within entry range {entry_price:.2f}–{entry_price*1.05:.2f}")
+                return None
+
+            # Filter for high volatility
+            if volatility <= 0.6:
+                print(f"{ticker} volatility {volatility:.2f} too low")
+                return None
+
+            # Filter for minimum volume
+            if avg_volume < 10000:
+                print(f"{ticker} volume {avg_volume:.0f} too low")
+                return None
+
+            # Exit prices based on entry price
+            target_price = entry_price * 1.10  # 10% above entry
+            stop_loss = entry_price * 0.95    # 5% below entry
+
+            # Shares to buy based on current price
+            shares = min(PER_STOCK_INVESTMENT // current_price, PORTFOLIO_SIZE // (current_price * STOCKS_PER_DAY))
+            if shares < 1:
+                print(f"Cannot afford {ticker} at current price {current_price:.2f}")
+                return None
+
+            return {
+                'rsi': rsi[-1] if not pd.isna(rsi[-1]) else 50,
+                'macd': macd[-1] - signal[-1] if not pd.isna(macd[-1]) else 0,
+                'macd_momentum': macd_momentum,
+                'price': current_price,
+                'volatility': volatility,
+                'entry_price': entry_price,
+                'target_price': target_price,
+                'stop_loss': stop_loss,
+                'shares': int(shares),
+                'upper_band': upper_band[-1],
+                'lower_band': lower_band[-1],
+                'pe_ratio': pe_ratio,
+                'avg_volume': avg_volume,
+                'high_20d': high_20d,
+                'price_momentum': price_momentum
+            }
+        except Exception as e:
+            print(f"Error processing {ticker}: {str(e)}")
+            if "Too Many Requests" in str(e) and attempt < 2:
+                wait_time = 2 ** attempt  # Exponential backoff: 1, 2, 4 seconds
+                print(f"Retrying {ticker} after {wait_time} seconds...")
+                time.sleep(wait_time)
+                continue
             return None
 
-        # Calculate 5-day RSI
-        delta = hist['Close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=5).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=5).mean()
-        rs = gain / loss
-        rsi = 100 - (100 / (1 + rs))
-
-        # Calculate fast MACD (5, 13, 5)
-        exp1 = hist['Close'].ewm(span=5, adjust=False).mean()
-        exp2 = hist['Close'].ewm(span=13, adjust=False).mean()
-        macd = exp1 - exp2
-        signal = macd.ewm(span=5, adjust=False).mean()
-
-        # MACD momentum (increasing over 2 days)
-        macd_values = macd[-3:]
-        macd_momentum = all(macd_values[i] < macd_values[i+1] for i in range(len(macd_values)-1))
-
-        # Calculate Bollinger Bands and SMA
-        sma = hist['Close'].rolling(window=20).mean()
-        std = hist['Close'].rolling(window=20).std()
-        upper_band = sma + (std * 2)
-        lower_band = sma - (std * 2)
-
-        # Volatility
-        returns = hist['Close'].pct_change()
-        volatility = returns.std() * (252 ** 0.5)
-
-        # Volume (20-day average)
-        avg_volume = hist['Volume'].rolling(window=20).mean()[-1] if not hist['Volume'].empty else 0
-
-        # Fundamentals (P/E Ratio)
-        pe_ratio = stock.info.get('trailingPE', 0)
-
-        # Current price
-        current_price = hist['Close'][-1]
-
-        # 20-day high for breakout detection
-        high_20d = hist['High'].rolling(window=20).max()[-1]
-
-        # 5-day price momentum
-        price_5d_ago = hist['Close'][-6] if len(hist) >= 6 else current_price
-        price_momentum = (current_price - price_5d_ago) / price_5d_ago
-
-        # Entry price (20-day SMA + 1%)
-        entry_price = sma[-1] * 1.01
-
-        # Filter for stocks where current price has just passed entry price
-        if not (entry_price <= current_price <= entry_price * 1.05):
-            print(f"{ticker} current price {current_price:.2f} not within entry range {entry_price:.2f}–{entry_price*1.05:.2f}")
-            return None
-
-        # Filter for high volatility
-        if volatility <= 0.6:
-            print(f"{ticker} volatility {volatility:.2f} too low")
-            return None
-
-        # Filter for minimum volume
-        if avg_volume < 10000:
-            print(f"{ticker} volume {avg_volume:.0f} too low")
-            return None
-
-        # Exit prices based on entry price
-        target_price = entry_price * 1.10  # 10% above entry
-        stop_loss = entry_price * 0.95    # 5% below entry
-
-        # Shares to buy based on current price
-        shares = min(PER_STOCK_INVESTMENT // current_price, PORTFOLIO_SIZE // (current_price * STOCKS_PER_DAY))
-        if shares < 1:
-            print(f"Cannot afford {ticker} at current price {current_price:.2f}")
-            return None
-
-        return {
-            'rsi': rsi[-1] if not pd.isna(rsi[-1]) else 50,
-            'macd': macd[-1] - signal[-1] if not pd.isna(macd[-1]) else 0,
-            'macd_momentum': macd_momentum,
-            'price': current_price,
-            'volatility': volatility,
-            'entry_price': entry_price,
-            'target_price': target_price,
-            'stop_loss': stop_loss,
-            'shares': int(shares),
-            'upper_band': upper_band[-1],
-            'lower_band': lower_band[-1],
-            'pe_ratio': pe_ratio,
-            'avg_volume': avg_volume,
-            'high_20d': high_20d,
-            'price_momentum': price_momentum
-        }
-    except Exception as e:
-        print(f"Error processing {ticker}: {e}")
-        return None
-
+@sleep_and_retry
+@limits(calls=5, period=60)  # Limit NewsAPI calls to 5 per minute
 def get_analyst_sentiment(ticker):
     """Fetch analyst sentiment from yfinance."""
     print(f"Fetching analyst sentiment for {ticker}...")
