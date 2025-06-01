@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Stock Suggestion Bot</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f4f4f4;
+        }
+        h1 {
+            text-align: center;
+            color: #333;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 0 10px rgba(0,0,0,0.1);
+        }
+        .stock {
+            margin: 10px 0;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+        }
+        .stock h3 {
+            margin: 0;
+            color: #2c3e50;
+        }
+        .stock p {
+            margin: 5px 0;
+        }
+        .error {
+            color: red;
+            text-align: center;
+        }
+        .note {
+            font-style: italic;
+            color: #555;
+        }
+        .warning {
+            color: #b22222;
+            font-weight: bold;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <h1>Daily Stock Picks - {{ date }}</h1>
+    <div class="container">
+        <p><strong>Total Daily Investment:</strong> $2,500 spread across 5 stocks (~$500 each)</p>
+        <p class="note">Stocks are selected where the current price has just passed the entry price (20-day Simple Moving Average + 1%), allowing immediate purchase at or near the current price ($5–$100, especially $5–$30) from S&P 500, Dow Jones, and Nasdaq-100 for high-risk, high-reward gains within 1-3 days.</p>
+        <p class="note">Sentiment is based on analyst ratings (1=Buy to 5=Sell, higher is better), with news sentiment as a fallback.</p>
+        <p class="warning">WARNING: These high-volatility, high-risk stocks may lead to significant losses. Consult a financial advisor before trading.</p>
+        {% if error %}
+        <p class="error">{{ error }}</p>
+        {% endif %}
+        {% if stocks %}
+        {% for stock in stocks %}
+        <div class="stock">
+            <h3>{{ stock.ticker }}</h3>
+            <p>Current Price: ${{ "%.2f" | format(stock.price) }}</p>
+            <p>Entry Price (Reference): ${{ "%.2f" | format(stock.entry_price) }}</p>
+            <p>Target Price (Sell): ${{ "%.2f" | format(stock.target_price) }}</p>
+            <p>Stop-Loss Price: ${{ "%.2f" | format(stock.stop_loss) }}</p>
+            <p>Shares to Buy: {{ stock.shares }} (~${{ "%.2f" | format(stock.shares * stock.price) }})</p>
+            <p>RSI (5-day): {{ "%.2f" | format(stock.rsi) }}</p>
+            <p>MACD: {{ "%.2f" | format(stock.macd) }}</p>
+            <p>Volatility: {{ "%.2f" | format(stock.volatility) }}</p>
+            <p>Sentiment: {{ "%.2f" | format(stock.sentiment) }}</p>
+            <p>P/E Ratio: {% if stock.pe_ratio is defined and stock.pe_ratio | float != 0 %}{{ "%.2f" | format(stock.pe_ratio) }}{% else %}N/A{% endif %}</p>
+            <p>Average Daily Volume: {% if stock.avg_volume is defined and stock.avg_volume | float > 0 %}{{ "%.0f" | format(stock.avg_volume) }} shares{% else %}N/A{% endif %}</p>
+            <p>Score: {{ stock.score }}</p>
+        </div>
+        {% endfor %}
+        {% else %}
+        <p>No stock picks available at this time.</p>
+        {% endif %}
+    </div>
+</body>
+</html>
