@@ -1,9 +1,7 @@
 flask
-yfinance
 pandas
 textblob
 requests
 lxml
 gunicorn
 ratelimit
-psutil

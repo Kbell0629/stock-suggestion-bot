@@ -1,5 +1,4 @@
 from flask import Flask, render_template
-import yfinance as yf
 import pandas as pd
 from textblob import TextBlob
 import requests
@@ -7,7 +6,6 @@ from datetime import datetime, timedelta
 import os
 import time
 from ratelimit import limits, sleep_and_retry
-import psutil
 import pickle
 import logging
 
@@ -17,8 +15,9 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Your NewsAPI key
-NEWS_API_KEY = os.getenv("NEWS_API_KEY", "c715f7725a3147dfbfa89e8d51ecd49b")
+# API keys
+ALPHA_VANTAGE_KEY = os.getenv("ALPHA_VANTAGE_KEY", "ZKIM7MWR7PHXHYWU")
+FINLIGHT_KEY = os.getenv("FINLIGHT_KEY", "sk_be774f798075218cf67071d562868776e91d910f1166ee36254e52fa94bc1601")
 
 # Portfolio settings
 DAILY_INVESTMENT = 2500
@@ -40,70 +39,10 @@ FALLBACK_TICKERS = [
     'PYPL', 'SQ', 'UBER', 'ZM', 'RBLX', 'PINS', 'SNAP', 'PLTR', 'SOFI', 'LCID'
 ]
 
-# Hardcoded DJIA tickers
-DJIA_FALLBACK = [
-    'AXP', 'AMGN', 'AAPL', 'BA', 'CAT', 'CSCO', 'KO', 'DIS', 'GS', 'HD'
-]
-
-# Fetch tickers
+# Fetch tickers (simplified to fallback for speed)
 def get_all_tickers():
-    logger.info("Fetching all tickers...")
-    tickers = set()
-    try:
-        url_sp500 = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        tables_sp500 = pd.read_html(url_sp500)
-        sp500_table = tables_sp500[0]
-        sp500_tickers = None
-        for col in ['Symbol', 'Ticker', 'Stock Symbol', 'Ticker symbol']:
-            if col in sp500_table.columns:
-                sp500_tickers = sp500_table[col].tolist()
-                break
-        if sp500_tickers:
-            tickers.update([ticker.replace('.', '-') for ticker in sp500_tickers])
-            logger.info(f"Added {len(sp500_tickers)} S&P 500 tickers")
-    except Exception as e:
-        logger.error(f"Error fetching S&P 500 tickers: {e}")
-
-    try:
-        url_djia = "https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average"
-        tables_djia = pd.read_html(url_djia, match="Constituents")
-        djia_table = tables_djia[0]
-        djia_tickers = None
-        for col in ['Symbol', 'Ticker', 'Stock Symbol', 'Ticker symbol']:
-            if col in djia_table.columns:
-                djia_tickers = djia_table[col].tolist()
-                break
-        if djia_tickers is None:
-            logger.info("Using DJIA fallback tickers")
-            djia_tickers = DJIA_FALLBACK
-        tickers.update([ticker.replace('.', '-') for ticker in djia_tickers])
-        logger.info(f"Added {len(djia_tickers)} DJIA tickers")
-    except Exception as e:
-        logger.error(f"Error fetching DJIA tickers: {e}")
-        tickers.update([ticker.replace('.', '-') for ticker in DJIA_FALLBACK])
-
-    try:
-        url_nasdaq = "https://en.wikipedia.org/wiki/Nasdaq-100"
-        tables_nasdaq = pd.read_html(url_nasdaq, match="Company")
-        nasdaq_table = tables_nasdaq[0]
-        nasdaq_tickers = None
-        for col in ['Ticker', 'Symbol', 'Stock Symbol']:
-            if col in nasdaq_table.columns:
-                nasdaq_tickers = nasdaq_table[col].tolist()
-                break
-        if nasdaq_tickers:
-            tickers.update([ticker.replace('.', '-') for ticker in nasdaq_tickers])
-            logger.info(f"Added {len(nasdaq_tickers)} Nasdaq-100 tickers")
-    except Exception as e:
-        logger.error(f"Error fetching Nasdaq-100 tickers: {e}")
-
-    if not tickers:
-        logger.info("No tickers retrieved, using fallback tickers")
-        return FALLBACK_TICKERS
-
-    tickers = list(tickers)
-    logger.info(f"Retrieved {len(tickers)} unique tickers")
-    return tickers[:30]  # Reduced to 30
+    logger.info("Using fallback tickers for simplicity")
+    return FALLBACK_TICKERS[:30]  # Limit to 30
 
 STOCKS = get_all_tickers()
 
@@ -130,12 +69,9 @@ def save_cache(data):
         logger.error(f"Error saving cache: {e}")
 
 @sleep_and_retry
-@limits(calls=1, period=1)
+@limits(calls=5, period=60)  # Alpha Vantage free tier: 5 calls/minute
 def get_stock_data(ticker):
     logger.info(f"Processing {ticker}...")
-    process = psutil.Process()
-    mem_before = process.memory_info().rss / 1024 / 1024
-
     cache = load_cache()
     if ticker in cache:
         logger.info(f"Using cached data for {ticker}")
@@ -143,44 +79,58 @@ def get_stock_data(ticker):
 
     for attempt in range(4):
         try:
-            stock = yf.Ticker(ticker)
-            hist = stock.history(period="1mo", interval="1d")
-
-            if hist.empty or len(hist) < 20:
+            # Fetch daily adjusted prices
+            url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY_ADJUSTED&symbol={ticker}&apikey={ALPHA_VANTAGE_KEY}&outputsize=compact"
+            response = requests.get(url, timeout=10)
+            if response.status_code != 200:
+                logger.error(f"Alpha Vantage error for {ticker}: Status {response.status_code}")
+                return None
+            data = response.json()
+            if "Time Series (Daily)" not in data:
                 logger.warning(f"No data for {ticker}")
                 return None
 
-            delta = hist['Close'].diff()
+            hist = pd.DataFrame.from_dict(data["Time Series (Daily)"], orient='index').astype(float)
+            hist.index = pd.to_datetime(hist.index)
+            hist = hist.sort_index()
+
+            if len(hist) < 20:
+                logger.warning(f"Insufficient data for {ticker}")
+                return None
+
+            delta = hist['4. close'].diff()
             gain = (delta.where(delta > 0, 0)).rolling(window=5).mean()
             loss = (-delta.where(delta < 0, 0)).rolling(window=5).mean()
             rs = gain / loss
             rsi = 100 - (100 / (1 + rs))
 
-            exp1 = hist['Close'].ewm(span=5, adjust=False).mean()
-            exp2 = hist['Close'].ewm(span=13, adjust=False).mean()
+            exp1 = hist['4. close'].ewm(span=5, adjust=False).mean()
+            exp2 = hist['4. close'].ewm(span=13, adjust=False).mean()
             macd = exp1 - exp2
             signal = macd.ewm(span=5, adjust=False).mean()
 
             macd_values = macd[-3:]
             macd_momentum = all(macd_values[i] < macd_values[i+1] for i in range(len(macd_values)-1))
 
-            sma = hist['Close'].rolling(window=20).mean()
-            std = hist['Close'].rolling(window=20).std()
+            sma = hist['4. close'].rolling(window=20).mean()
+            std = hist['4. close'].rolling(window=20).std()
             upper_band = sma + (std * 2)
             lower_band = sma - (std * 2)
 
-            returns = hist['Close'].pct_change()
+            returns = hist['4. close'].pct_change()
             volatility = returns.std() * (252 ** 0.5)
 
-            avg_volume = hist['Volume'].rolling(window=20).mean()[-1] if not hist['Volume'].empty else 0
+            avg_volume = hist['6. volume'].rolling(window=20).mean()[-1]
 
-            pe_ratio = stock.info.get('trailingPE', 0)
+            # Fetch fundamentals
+            url_fund = f"https://www.alphavantage.co/query?function=OVERVIEW&symbol={ticker}&apikey={ALPHA_VANTAGE_KEY}"
+            response_fund = requests.get(url_fund, timeout=10)
+            fund_data = response_fund.json()
+            pe_ratio = float(fund_data.get('PERatio', 0)) if fund_data.get('PERatio') != 'None' else 0
 
-            current_price = hist['Close'][-1]
-
-            high_20d = hist['High'].rolling(window=20).max()[-1]
-
-            price_5d_ago = hist['Close'][-6] if len(hist) >= 6 else current_price
+            current_price = hist['4. close'][-1]
+            high_20d = hist['2. high'].rolling(window=20).max()[-1]
+            price_5d_ago = hist['4. close'][-6] if len(hist) >= 6 else current_price
             price_momentum = (current_price - price_5d_ago) / price_5d_ago
 
             entry_price = sma[-1] * 1.01
@@ -224,9 +174,6 @@ def get_stock_data(ticker):
             }
 
             del hist, delta, gain, loss, rs, rsi, exp1, exp2, macd, signal, sma, std, upper_band, lower_band, returns
-            mem_after = process.memory_info().rss / 1024 / 1024
-            logger.info(f"Memory usage for {ticker}: {mem_after - mem_before:.2f} MB")
-
             cache[ticker] = result
             save_cache(cache)
             return result
@@ -234,36 +181,19 @@ def get_stock_data(ticker):
         except Exception as e:
             logger.error(f"Error processing {ticker}: {str(e)}")
             if "Too Many Requests" in str(e) and attempt < 3:
-                wait_time = 4 ** (attempt + 1)  # 4, 16, 64 seconds
+                wait_time = 4 ** (attempt + 1)
                 logger.info(f"Retrying {ticker} after {wait_time} seconds...")
                 time.sleep(wait_time)
                 continue
             return None
 
-@sleep_and_retry
-@limits(calls=5, period=60)
-def get_analyst_sentiment(ticker):
-    logger.info(f"Fetching analyst sentiment for {ticker}...")
-    try:
-        stock = yf.Ticker(ticker)
-        recommendation = stock.info.get('recommendationMean', 3.0)
-        sentiment = (3.0 - recommendation) / 2.0
-        logger.info(f"Analyst sentiment for {ticker}: {sentiment:.2f}")
-        return sentiment
-    except Exception as e:
-        logger.error(f"Analyst sentiment error for {ticker}: {e}")
-        return 0
-
 def get_news_sentiment(ticker):
     logger.info(f"Fetching news for {ticker}...")
     try:
-        stock = yf.Ticker(ticker)
-        company_name = stock.info.get('longName', '').split()[0] or ticker
-        query = f"{ticker} OR {company_name}"
-        url = f"https://newsapi.org/v2/everything?q={query}&apiKey={NEWS_API_KEY}&language=en&sortBy=publishedAt"
+        url = f"https://api.finlight.me/v1/news?ticker={ticker}&api_key={FINLIGHT_KEY}"
         response = requests.get(url, timeout=30)
         if response.status_code != 200:
-            logger.error(f"NewsAPI error for {ticker}: Status {response.status_code}")
+            logger.error(f"Finlight error for {ticker}: Status {response.status_code}")
             return 0
         data = response.json()
         articles = data.get('articles', [])
@@ -273,7 +203,7 @@ def get_news_sentiment(ticker):
         sentiment_score = 0
         count = 0
         for article in articles[:5]:
-            text = article.get('title', '') + ' ' + article.get('description', '')
+            text = article.get('title', '') + ' ' + article.get('summary', '')
             if text.strip():
                 analysis = TextBlob(text)
                 sentiment_score += analysis.sentiment.polarity
@@ -297,7 +227,7 @@ def select_stocks():
             if not data:
                 logger.info(f"Skipping {ticker} due to missing data")
                 continue
-            sentiment = get_analyst_sentiment(ticker)
+            sentiment = get_news_sentiment(ticker)
 
             score = 0
             if 10 < data['rsi'] < 70:
@@ -345,12 +275,12 @@ def select_stocks():
 
     if len(stock_scores) < 5:
         logger.info(f"Only {len(stock_scores)} stocks scored. Using fallback scoring.")
-        for ticker in STOCKS[:20]:
+        for ticker in STOCKS[:10]:
             try:
                 data = get_stock_data(ticker)
                 if not data:
                     continue
-                sentiment = get_analyst_sentiment(ticker)
+                sentiment = get_news_sentiment(ticker)
 
                 score = 0
                 if data['entry_price'] <= MAX_ENTRY_PRICE:
