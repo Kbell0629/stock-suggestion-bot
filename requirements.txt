@@ -6,3 +6,4 @@ requests
 lxml
 gunicorn
 ratelimit
+psutil
