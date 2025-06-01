@@ -3,13 +3,19 @@ import yfinance as yf
 import pandas as pd
 from textblob import TextBlob
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 import time
 from ratelimit import limits, sleep_and_retry
 import psutil
+import pickle
+import logging
 
 app = Flask(__name__)
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Your NewsAPI key
 NEWS_API_KEY = os.getenv("NEWS_API_KEY", "c715f7725a3147dfbfa89e8d51ecd49b")
@@ -23,24 +29,25 @@ MAX_ENTRY_PRICE = 100
 MIN_ENTRY_PRICE = 5
 PENNY_PRICE = 30
 
+# Cache settings
+CACHE_FILE = "stock_data_cache.pkl"
+CACHE_DURATION = timedelta(hours=1)
+
 # Fallback ticker list
 FALLBACK_TICKERS = [
-    'SIRI', 'F', 'NIO', 'AMD', 'BA', 'DIS', 'NFLX', 'CSCO', 'INTC', 'PFE',
-    'T', 'VZ', 'CMCSA', 'ADBE', 'CRM', 'QCOM', 'TXN', 'AMAT', 'LRCX', 'MU',
-    'GILD', 'REGN', 'BIIB', 'OKTA', 'ZS', 'DDOG', 'CRWD', 'PANW', 'SPLK', 'NOW',
-    'PYPL', 'SQ', 'SHOP', 'UBER', 'LYFT', 'ZM', 'DOCU', 'RBLX', 'PINS', 'SNAP',
-    'X', 'PLTR', 'SOFI', 'LCID', 'RIVN'
+    'SIRI', 'F', 'NIO', 'AMD', 'BA', 'DIS', 'CSCO', 'INTC', 'PFE', 'T',
+    'VZ', 'CMCSA', 'QCOM', 'AMAT', 'MU', 'GILD', 'OKTA', 'ZS', 'DDOG', 'CRWD',
+    'PYPL', 'SQ', 'UBER', 'ZM', 'RBLX', 'PINS', 'SNAP', 'PLTR', 'SOFI', 'LCID'
 ]
 
 # Hardcoded DJIA tickers
 DJIA_FALLBACK = [
-    'MMM', 'AXP', 'AMGN', 'AAPL', 'BA', 'CAT', 'CVX', 'CSCO', 'KO', 'DIS',
-    'DOW', 'GS', 'HD', 'HON', 'IBM', 'INTC', 'JNJ', 'JPM', 'MCD', 'MRK'
+    'AXP', 'AMGN', 'AAPL', 'BA', 'CAT', 'CSCO', 'KO', 'DIS', 'GS', 'HD'
 ]
 
 # Fetch tickers
 def get_all_tickers():
-    print("Fetching all tickers...")
+    logger.info("Fetching all tickers...")
     tickers = set()
     try:
         url_sp500 = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
@@ -53,9 +60,9 @@ def get_all_tickers():
                 break
         if sp500_tickers:
             tickers.update([ticker.replace('.', '-') for ticker in sp500_tickers])
-            print(f"Added {len(sp500_tickers)} S&P 500 tickers")
+            logger.info(f"Added {len(sp500_tickers)} S&P 500 tickers")
     except Exception as e:
-        print(f"Error fetching S&P 500 tickers: {e}")
+        logger.error(f"Error fetching S&P 500 tickers: {e}")
 
     try:
         url_djia = "https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average"
@@ -67,12 +74,12 @@ def get_all_tickers():
                 djia_tickers = djia_table[col].tolist()
                 break
         if djia_tickers is None:
-            print("Using DJIA fallback tickers")
+            logger.info("Using DJIA fallback tickers")
             djia_tickers = DJIA_FALLBACK
         tickers.update([ticker.replace('.', '-') for ticker in djia_tickers])
-        print(f"Added {len(djia_tickers)} DJIA tickers")
+        logger.info(f"Added {len(djia_tickers)} DJIA tickers")
     except Exception as e:
-        print(f"Error fetching DJIA tickers: {e}")
+        logger.error(f"Error fetching DJIA tickers: {e}")
         tickers.update([ticker.replace('.', '-') for ticker in DJIA_FALLBACK])
 
     try:
@@ -86,33 +93,61 @@ def get_all_tickers():
                 break
         if nasdaq_tickers:
             tickers.update([ticker.replace('.', '-') for ticker in nasdaq_tickers])
-            print(f"Added {len(nasdaq_tickers)} Nasdaq-100 tickers")
+            logger.info(f"Added {len(nasdaq_tickers)} Nasdaq-100 tickers")
     except Exception as e:
-        print(f"Error fetching Nasdaq-100 tickers: {e}")
+        logger.error(f"Error fetching Nasdaq-100 tickers: {e}")
 
     if not tickers:
-        print("No tickers retrieved, using fallback tickers")
+        logger.info("No tickers retrieved, using fallback tickers")
         return FALLBACK_TICKERS
 
     tickers = list(tickers)
-    print(f"Retrieved {len(tickers)} unique tickers")
-    return tickers[:50]  # Reduced to 50
+    logger.info(f"Retrieved {len(tickers)} unique tickers")
+    return tickers[:30]  # Reduced to 30
 
 STOCKS = get_all_tickers()
 
+def load_cache():
+    try:
+        if os.path.exists(CACHE_FILE):
+            with open(CACHE_FILE, 'rb') as f:
+                cache = pickle.load(f)
+            if cache['timestamp'] > datetime.now() - CACHE_DURATION:
+                logger.info("Loaded valid cache")
+                return cache['data']
+        return {}
+    except Exception as e:
+        logger.error(f"Error loading cache: {e}")
+        return {}
+
+def save_cache(data):
+    try:
+        cache = {'timestamp': datetime.now(), 'data': data}
+        with open(CACHE_FILE, 'wb') as f:
+            pickle.dump(cache, f)
+        logger.info("Saved cache")
+    except Exception as e:
+        logger.error(f"Error saving cache: {e}")
+
 @sleep_and_retry
-@limits(calls=1, period=1)  # 1 call/second
+@limits(calls=1, period=1)
 def get_stock_data(ticker):
-    print(f"Processing {ticker}...")
+    logger.info(f"Processing {ticker}...")
     process = psutil.Process()
-    mem_before = process.memory_info().rss / 1024 / 1024  # MB
-    for attempt in range(4):  # Retry up to 4 times
+    mem_before = process.memory_info().rss / 1024 / 1024
+
+    cache = load_cache()
+    if ticker in cache:
+        logger.info(f"Using cached data for {ticker}")
+        return cache[ticker]
+
+    for attempt in range(4):
         try:
             stock = yf.Ticker(ticker)
             hist = stock.history(period="1mo", interval="1d")
 
             if hist.empty or len(hist) < 20:
-                print(f"No data for {ticker}")
+                logger.warning(f"No data for {ticker}")
                 return None
 
             delta = hist['Close'].diff()
@@ -151,15 +186,15 @@ def get_stock_data(ticker):
             entry_price = sma[-1] * 1.01
 
             if not (entry_price <= current_price <= entry_price * 1.05):
-                print(f"{ticker} current price {current_price:.2f} not within entry range {entry_price:.2f}–{entry_price*1.05:.2f}")
+                logger.info(f"{ticker} current price {current_price:.2f} not within entry range {entry_price:.2f}–{entry_price*1.05:.2f}")
                 return None
 
             if volatility <= 0.6:
-                print(f"{ticker} volatility {volatility:.2f} too low")
+                logger.info(f"{ticker} volatility {volatility:.2f} too low")
                 return None
 
             if avg_volume < 10000:
-                print(f"{ticker} volume {avg_volume:.0f} too low")
+                logger.info(f"{ticker} volume {avg_volume:.0f} too low")
                 return None
 
             target_price = entry_price * 1.10
@@ -167,7 +202,7 @@ def get_stock_data(ticker):
 
             shares = min(PER_STOCK_INVESTMENT // current_price, PORTFOLIO_SIZE // (current_price * STOCKS_PER_DAY))
             if shares < 1:
-                print(f"Cannot afford {ticker} at current price {current_price:.2f}")
+                logger.info(f"Cannot afford {ticker} at current price {current_price:.2f}")
                 return None
 
             result = {
@@ -188,17 +223,19 @@ def get_stock_data(ticker):
                 'price_momentum': price_momentum
             }
 
-            # Clear large objects
             del hist, delta, gain, loss, rs, rsi, exp1, exp2, macd, signal, sma, std, upper_band, lower_band, returns
-            mem_after = process.memory_info().rss / 1024 / 1024  # MB
-            print(f"Memory usage for {ticker}: {mem_after - mem_before:.2f} MB")
+            mem_after = process.memory_info().rss / 1024 / 1024
+            logger.info(f"Memory usage for {ticker}: {mem_after - mem_before:.2f} MB")
+
+            cache[ticker] = result
+            save_cache(cache)
             return result
 
         except Exception as e:
-            print(f"Error processing {ticker}: {str(e)}")
+            logger.error(f"Error processing {ticker}: {str(e)}")
             if "Too Many Requests" in str(e) and attempt < 3:
-                wait_time = 2 ** (attempt + 1)  # 2, 4, 8 seconds
-                print(f"Retrying {ticker} after {wait_time} seconds...")
+                wait_time = 4 ** (attempt + 1)  # 4, 16, 64 seconds
+                logger.info(f"Retrying {ticker} after {wait_time} seconds...")
                 time.sleep(wait_time)
                 continue
             return None
@@ -206,19 +243,19 @@ def get_stock_data(ticker):
 @sleep_and_retry
 @limits(calls=5, period=60)
 def get_analyst_sentiment(ticker):
-    print(f"Fetching analyst sentiment for {ticker}...")
+    logger.info(f"Fetching analyst sentiment for {ticker}...")
     try:
         stock = yf.Ticker(ticker)
         recommendation = stock.info.get('recommendationMean', 3.0)
         sentiment = (3.0 - recommendation) / 2.0
-        print(f"Analyst sentiment for {ticker}: {sentiment:.2f}")
+        logger.info(f"Analyst sentiment for {ticker}: {sentiment:.2f}")
         return sentiment
     except Exception as e:
-        print(f"Analyst sentiment error for {ticker}: {e}")
+        logger.error(f"Analyst sentiment error for {ticker}: {e}")
         return 0
 
 def get_news_sentiment(ticker):
-    print(f"Fetching news for {ticker}...")
+    logger.info(f"Fetching news for {ticker}...")
     try:
         stock = yf.Ticker(ticker)
         company_name = stock.info.get('longName', '').split()[0] or ticker
@@ -226,12 +263,12 @@ def get_news_sentiment(ticker):
         url = f"https://newsapi.org/v2/everything?q={query}&apiKey={NEWS_API_KEY}&language=en&sortBy=publishedAt"
         response = requests.get(url, timeout=30)
         if response.status_code != 200:
-            print(f"NewsAPI error for {ticker}: Status {response.status_code}")
+            logger.error(f"NewsAPI error for {ticker}: Status {response.status_code}")
             return 0
         data = response.json()
         articles = data.get('articles', [])
         if not articles:
-            print(f"No articles found for {ticker}")
+            logger.info(f"No articles found for {ticker}")
             return 0
         sentiment_score = 0
         count = 0
@@ -242,28 +279,25 @@ def get_news_sentiment(ticker):
                 sentiment_score += analysis.sentiment.polarity
                 count += 1
         if count == 0:
-            print(f"No valid articles for {ticker}")
+            logger.info(f"No valid articles for {ticker}")
             return 0
         avg_sentiment = sentiment_score / count
-        print(f"News sentiment for {ticker}: {avg_sentiment:.2f}")
+        logger.info(f"News sentiment for {ticker}: {avg_sentiment:.2f}")
         return avg_sentiment
     except Exception as e:
-        print(f"News error for {ticker}: {e}")
+        logger.error(f"News error for {ticker}: {e}")
         return 0
 
 def select_stocks():
-    print("Selecting stocks...")
+    logger.info("Selecting stocks...")
     stock_scores = []
     for ticker in STOCKS:
         try:
             data = get_stock_data(ticker)
             if not data:
-                print(f"Skipping {ticker} due to missing data")
+                logger.info(f"Skipping {ticker} due to missing data")
                 continue
             sentiment = get_analyst_sentiment(ticker)
-            # Skip NewsAPI to reduce load
-            # if sentiment == 0:
-            #     sentiment = get_news_sentiment(ticker)
 
             score = 0
             if 10 < data['rsi'] < 70:
@@ -304,14 +338,14 @@ def select_stocks():
                 'avg_volume': data.get('avg_volume', 0)
             }
             stock_scores.append(stock_data)
-            print(f"Scored {ticker}: Score {score}")
+            logger.info(f"Scored {ticker}: Score {score}")
         except Exception as e:
-            print(f"Error in scoring {ticker}: {e}")
+            logger.error(f"Error in scoring {ticker}: {e}")
             continue
 
     if len(stock_scores) < 5:
-        print(f"Only {len(stock_scores)} stocks scored. Using fallback scoring.")
-        for ticker in STOCKS[:50]:
+        logger.info(f"Only {len(stock_scores)} stocks scored. Using fallback scoring.")
+        for ticker in STOCKS[:20]:
             try:
                 data = get_stock_data(ticker)
                 if not data:
@@ -341,13 +375,13 @@ def select_stocks():
                     'avg_volume': data.get('avg_volume', 0)
                 }
                 stock_scores.append(stock_data)
-                print(f"Fallback scored {ticker}: Score {score}")
+                logger.info(f"Fallback scored {ticker}: Score {score}")
             except Exception as e:
-                print(f"Error in fallback scoring {ticker}: {e}")
+                logger.error(f"Error in fallback scoring {ticker}: {e}")
                 continue
 
     if not stock_scores:
-        print("No stocks scored. Using minimal fallback.")
+        logger.warning("No stocks scored. Using static fallback.")
         return [
             {'ticker': 'SIRI', 'score': 100, 'price': 5.60, 'rsi': 50, 'macd': 0, 'volatility': 0.9, 'sentiment': 0.5, 'entry_price': 5.50, 'target_price': 6.05, 'stop_loss': 5.23, 'shares': 89, 'pe_ratio': 9.5, 'avg_volume': 4000000},
             {'ticker': 'F', 'score': 95, 'price': 10.30, 'rsi': 50, 'macd': 0, 'volatility': 0.85, 'sentiment': 0.5, 'entry_price': 10.20, 'target_price': 11.22, 'stop_loss': 9.69, 'shares': 48, 'pe_ratio': 8.5, 'avg_volume': 3000000},
@@ -357,17 +391,17 @@ def select_stocks():
         ]
 
     sorted_stocks = sorted(stock_scores, key=lambda x: x['score'], reverse=True)[:5]
-    print(f"Selected {len(sorted_stocks)} stocks")
+    logger.info(f"Selected {len(sorted_stocks)} stocks")
     return sorted_stocks
 
 @app.route('/')
 def home():
-    print("Rendering homepage...")
+    logger.info("Rendering homepage...")
     try:
         stocks = select_stocks()
         return render_template('index.html', stocks=stocks, date=datetime.now().strftime("%Y-%m-%d"))
     except Exception as e:
-        print(f"Error rendering homepage: {e}")
+        logger.error(f"Error rendering homepage: {e}")
         return render_template('index.html', stocks=[
             {'ticker': 'SIRI', 'score': 100, 'price': 5.60, 'rsi': 50, 'macd': 0, 'volatility': 0.9, 'sentiment': 0.5, 'entry_price': 5.50, 'target_price': 6.05, 'stop_loss': 5.23, 'shares': 89, 'pe_ratio': 9.5, 'avg_volume': 4000000},
             {'ticker': 'F', 'score': 95, 'price': 10.30, 'rsi': 50, 'macd': 0, 'volatility': 0.85, 'sentiment': 0.5, 'entry_price': 10.20, 'target_price': 11.22, 'stop_loss': 9.69, 'shares': 48, 'pe_ratio': 8.5, 'avg_volume': 3000000},
